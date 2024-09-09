@@ -2,11 +2,15 @@ configs:
   # general optimization parameters:
   batch_size: 10000
   max_epochs: 5000
-  learning_rate: .005
+  learning_rate: .05
   min_delta: 0.0000000008
   patience: 100
   single_epoch_test_run: False
   which_data: 'sim'
-  ndim: 1
+  mirt_dim: 1
+  class_prob: .5
+  N: 1000
   nitems: 10
+  temperature_decay: .995
+  n_iw_samples: 25
 

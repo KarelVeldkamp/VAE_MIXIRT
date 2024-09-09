@@ -24,6 +24,29 @@ class CSVDataset(Dataset):
         return self.x_train[idx]
 
 
+class SimDataset(Dataset):
+    """
+    Torch dataset for item response data in numpy array
+    """
+    def __init__(self, X, device='cpu'):
+        """
+        initialize
+        :param file_name: path to csv that contains NXI matrix of responses from N people to I items
+        """
+        # Read csv and ignore rownames
+
+
+        self.x_train = torch.tensor(X, dtype=torch.float32)
+        self.x_train = self.x_train.to(device)
+
+
+    def __len__(self):
+        return len(self.x_train)
+
+    def __getitem__(self, idx):
+        return self.x_train[idx]
+
+
 class MNISTDataset(Dataset):
     """
     Torch dataset for item response data in numpy array

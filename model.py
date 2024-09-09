@@ -7,13 +7,13 @@ import pytorch_lightning as pl
 
 
 class GumbelSoftmax(pl.LightningModule):
-    def __init__(self):
+    def __init__(self, temperature_decay):
         super(GumbelSoftmax, self).__init__()
         # Gumbel distribution
         self.G = torch.distributions.Gumbel(0, 1)
-        self.softmax = torch.nn.Softmax(dim=1)
-        self.temperature = 10
-        self.temperature_decay = .9999
+        self.softmax = torch.nn.Softmax(dim=-1)
+        self.temperature = 1
+        self.temperature_decay = temperature_decay
 
     def forward(self, log_pi):
         # sample gumbel variable and move to correct device
@@ -99,7 +99,7 @@ class Decoder(pl.LightningModule):
         :return: tensor representing reconstructed item responses
         """
         #print(cl[:, 0:1])
-        out = self.linear1(theta) * cl[:,0:1] + self.linear2(theta) * cl[:,1:2]
+        out = self.linear1(theta) * cl[:,:,0:1] + self.linear2(theta) * cl[:,:,1:2]
         out = self.activation(out)
         return out
 
@@ -129,6 +129,8 @@ class VAE(pl.LightningModule):
                  qm: torch.Tensor,
                  learning_rate: float,
                  batch_size: int,
+                 n_iw_samples: int,
+                 temperature_decay:int,
                  beta: int = 1):
         """
         Initialisaiton
@@ -145,8 +147,9 @@ class VAE(pl.LightningModule):
                                hidden_layer_size
         )
 
-        self.GumbelSoftmax = GumbelSoftmax()
+        self.GumbelSoftmax = GumbelSoftmax(temperature_decay)
         self.sampler = SamplingLayer()
+        self.latent_dims = latent_dims
 
 
         self.decoder = Decoder(nitems, latent_dims, qm)
@@ -154,6 +157,7 @@ class VAE(pl.LightningModule):
         self.lr = learning_rate
         self.batch_size = batch_size
         self.beta = beta
+        self.n_samples = n_iw_samples
         self.kl=0
 
     def forward(self, x: torch.Tensor, m: torch.Tensor=None):
@@ -164,32 +168,27 @@ class VAE(pl.LightningModule):
         :return: tensor representing a reconstruction of the input response data
         """
         mu, log_sigma, cl = self.encoder(x)
+        mu = mu.repeat(self.n_samples,1,1)
+        log_sigma = log_sigma.repeat(self.n_samples,1,1)
+        cl = cl.repeat(self.n_samples,1,1)
+
         cl = self.GumbelSoftmax(cl)
-        theta = self.sampler(mu, log_sigma)
+        z = self.sampler(mu, log_sigma)
 
-        reco = self.decoder(cl, theta)
+        reco = self.decoder(cl, z)
 
-        # Calcualte the estimated probabilities
-
-        # calculate kl divergence
-        kl = 1 + 2 * log_sigma - torch.square(mu) - torch.exp(2 * log_sigma)
-        kl = torch.sum(kl, dim=-1)
-        self.kl = -.5 * torch.mean(kl)
-        return reco
+        return reco, mu, log_sigma, z
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr, amsgrad=True)
 
     def training_step(self, batch, batch_idx):
         # forward pass
-
         data = batch
-        X_hat = self(data)
+        reco, mu, log_sigma, z = self(data)
 
-        bce = torch.nn.functional.binary_cross_entropy(X_hat, batch, reduction='none')
-        bce = torch.mean(bce) * self.nitems
-
-        loss = bce + self.beta * torch.sum(self.kl)
+        mask = torch.ones_like(data)
+        loss, _ = self.loss(data, reco, mask, mu, log_sigma, z)
         self.GumbelSoftmax.temperature *= self.GumbelSoftmax.temperature_decay
         self.log('train_loss',loss)
 
@@ -197,3 +196,57 @@ class VAE(pl.LightningModule):
 
     def train_dataloader(self):
         return self.dataloader
+
+    def loss(self, input, reco, mask, mu, sigma, z):
+        #calculate log likelihood
+
+        input = input.unsqueeze(0).repeat(reco.shape[0], 1, 1) # repeat input k times (to match reco size)
+        log_p_x_theta = ((input * reco).clamp(1e-7).log() + ((1 - input) * (1 - reco)).clamp(1e-7).log()) # compute log ll
+        logll = (log_p_x_theta * mask).sum(dim=-1, keepdim=True) # set elements based on missing data to zero
+        #
+        # calculate KL divergence
+        log_q_theta_x = torch.distributions.Normal(mu, sigma.exp()).log_prob(z).sum(dim = -1, keepdim = True) # log q(Theta|X)
+        log_p_theta = torch.distributions.Normal(torch.zeros_like(z).to(input), scale=torch.ones(mu.shape[2]).to(input)).log_prob(z).sum(dim = -1, keepdim = True) # log p(Theta)
+        kl =  log_q_theta_x - log_p_theta # kl divergence
+
+        # combine into ELBO
+        elbo = logll - kl
+        # # perform importance weighting
+        with torch.no_grad():
+            weight = (elbo - elbo.logsumexp(dim=0)).exp()
+        #
+        loss = (-weight * elbo).sum(0).mean()
+
+
+        return loss, weight
+
+    def fscores(self, batch, n_mc_samples=50):
+        data = batch
+
+        if self.n_samples == 1:
+            mu, _, _ = self.encoder(data)
+            return mu.unsqueeze(0)
+        else:
+            scores = torch.empty((n_mc_samples, data.shape[0], self.latent_dims))
+            for i in range(n_mc_samples):
+                reco, mu, log_sigma, z = self(data)
+                mask = torch.ones_like(data)
+                loss, weight = self.loss(data, reco, mask, mu, log_sigma, z)
+
+                idxs = torch.distributions.Categorical(probs=weight.permute(1,2,0)).sample()
+
+                # Reshape idxs to match the dimensions required by gather
+                # Ensure idxs is of the correct type
+                idxs = idxs.long()
+
+                # Expand idxs to match the dimensions required for gather
+                idxs_expanded = idxs.unsqueeze(-1).expand(-1, -1, z.size(2))  # Shape [10000, 1, 3]
+
+                # Use gather to select the appropriate elements from z
+                output = torch.gather(z.transpose(0, 1), 1, idxs_expanded).squeeze().detach() # Shape [10000, latent dims]
+                if self.latent_dims == 1:
+                    output = output.unsqueeze(-1)
+
+                scores[i, :, :] = output
+
+            return scores
