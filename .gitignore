@@ -1,5 +1,5 @@
-./figures/**
-./logs/**
-./data/**
-./venv/**
-./.venv/**
+figures/**
+logs/**
+data/**
+venv/**
+.venv/**
