@@ -11,6 +11,6 @@ configs:
   class_prob: .5
   N: 1000
   nitems: 10
-  temperature_decay: .995
-  n_iw_samples: 25
+  temperature_decay: .999
+  n_iw_samples: 1
 

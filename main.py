@@ -93,17 +93,36 @@ elif cfg['which_data'] == 'sim':
     np.fill_diagonal(covMat, 1)
     true_theta = np.random.multivariate_normal([0] * cfg['mirt_dim'], covMat, cfg['N'])
     true_difficulty = np.random.uniform(-2, 2, (cfg['nitems'], 2))
+    true_slopes = np.random.uniform(.5, 2, (cfg['nitems'],2))
+    #true_slopes = np.ones((cfg['nitems'], 2))
+
 
     theta_repeat = np.repeat(true_theta, cfg['nitems'], -1)
-    difficulty0 = np.expand_dims(true_difficulty[:, 0], 0)
-    difficulty1 = np.expand_dims(true_difficulty[:, 1], 0)
+    b0 = true_difficulty[:, 0]
+    b1 = true_difficulty[:, 1]
+    a0 = np.expand_dims(true_slopes[:, 0], -1)
+    a1 = np.expand_dims(true_slopes[:, 1], -1)
 
-    print((theta_repeat - difficulty0).shape)
-    prob = sigmoid((theta_repeat + difficulty0) * true_class + (theta_repeat + difficulty1) * (1 - true_class))
 
+    if cfg['mirt_dim'] >1:
+        Q = pd.read_csv(f'./QMatrices/QMatrix{cfg["mirt_dim"]}D.csv', header=None).values
+        a0 *= Q
+        a1 *= Q
+    else:
+        Q = None
+
+
+    exponent = (np.dot(true_theta, a0.T) + b0) * true_class + (np.dot(true_theta, a1.T) + b1) * (1-true_class)
+
+    prob = np.exp(exponent) / (1 + np.exp(exponent))
     data = np.random.binomial(1, prob).astype(float)
+
     dataset = SimDataset(data)
     true_class = np.squeeze(true_class)
+
+
+
+
 
 
 
@@ -119,16 +138,20 @@ vae = VAE(dataloader=train_loader,
           temperature_decay=cfg['temperature_decay'],
           beta=1)
 
-vae.decoder.linear1.weight.requires_grad_(False)
-vae.decoder.linear2.weight.requires_grad_(False)
+# vae.decoder.weights1.requires_grad_(False)
+# vae.decoder.weights2.requires_grad_(False)
+# vae.decoder.bias1.requires_grad_(False)
+# vae.decoder.bias2.requires_grad_(False)
 
 trainer.fit(vae)
 
 
 # calculate predicted class labels
-a_est = vae.decoder.linear1.weight.detach().cpu().numpy()
-d1_est = vae.decoder.linear1.bias.detach().cpu().numpy()
-d2_est = vae.decoder.linear2.bias.detach().cpu().numpy()
+a1_est = vae.decoder.weights1.detach().cpu().numpy()
+a2_est = vae.decoder.weights2.detach().cpu().numpy()
+d1_est = vae.decoder.bias1.detach().cpu().numpy()
+d2_est = vae.decoder.bias2.detach().cpu().numpy()
+
 
 dataset = SimDataset(data)
 train_loader = DataLoader(dataset, batch_size=data.shape[0], shuffle=False)
@@ -136,9 +159,8 @@ data = next(iter(train_loader))
 _, log_sigma_est, cl = vae.encoder(data)
 post_samples = vae.fscores(data)
 theta = post_samples.mean(0)
+print(vae.GumbelSoftmax(cl))
 cl = torch.argmax(cl, dim=1)
-
-
 
 
 # label switching
@@ -150,11 +172,10 @@ if pearsonr(cl, true_class).statistic < 0:
     cl[tmp == 1] = 0
 
     # swap difficulty paramters
-    print(d1_est)
-    tmp = d1_est
-    d1_est = d2_est
-    d2_est = tmp
-    print(d1_est)
+    d1_est, d2_est = d2_est, d1_est
+    # swap slope parameters
+    a1_est, a2_est = a2_est, a1_est
+
 
 
 acc = torch.mean((cl== true_class).float())
@@ -184,12 +205,30 @@ plt.savefig(f'./figures/{cfg["which_data"]}/difficulty_1.png')
 
 plt.figure()
 mse = MSE(d2_est, true_difficulty[:, 0])
-plt.scatter(y=d2_est, x=true_difficulty[:, 0])
+plt.scatter(y=d2_est, x=true_difficulty[:,0])
 plt.plot(true_difficulty[:, 0], true_difficulty[:, 0])
 plt.title(f'Difficulty 2:, MSE={round(mse,4)}')
 plt.xlabel('True values')
 plt.ylabel('Estimates')
 plt.savefig(f'./figures/{cfg["which_data"]}/difficulty_2.png')
+
+plt.figure()
+mse = MSE(a1_est, true_slopes[:, 1])
+plt.scatter(y=a1_est, x=true_slopes[:, 1])
+plt.plot(true_slopes[:, 1], true_slopes[:, 1])
+plt.title(f'Slopes 1:, MSE={round(mse,4)}')
+plt.xlabel('True values')
+plt.ylabel('Estimates')
+plt.savefig(f'./figures/{cfg["which_data"]}/slopes_1.png')
+
+plt.figure()
+mse = MSE(a2_est, true_slopes[:, 0])
+plt.scatter(y=a2_est, x=true_slopes[:, 0])
+plt.plot(true_slopes[:, 0], true_slopes[:, 0])
+plt.title(f'Slopes 2:, MSE={round(mse,4)}')
+plt.xlabel('True values')
+plt.ylabel('Estimates')
+plt.savefig(f'./figures/{cfg["which_data"]}/slopes_2.png')
 
 # plot training loss
 plt.figure()

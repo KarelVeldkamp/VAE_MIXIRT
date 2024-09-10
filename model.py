@@ -75,21 +75,22 @@ class Decoder(pl.LightningModule):
         """
         super().__init__()
         # one layer for each class
-        self.linear1 = nn.Linear(latent_dims, nitems, bias=True)
-        self.linear1.weight = nn.Parameter(torch.ones(self.linear1.weight.shape), requires_grad=False)
-        self.linear2 = nn.Linear(latent_dims, nitems, bias=True)
-        self.linear2.weight = nn.Parameter(torch.ones(self.linear2.weight.shape), requires_grad=False)
+        #self.linear1 = nn.Linear(latent_dims, nitems, bias=True)
+        #self.linear1.weight = nn.Parameter(torch.ones(self.linear1.weight.shape), requires_grad=False)
+        #self.linear2 = nn.Linear(latent_dims, nitems, bias=True)
+        #self.linear2.weight = nn.Parameter(torch.ones(self.linear2.weight.shape), requires_grad=False)
+
+        self.weights1 = nn.Parameter(torch.ones((latent_dims, nitems)))  # Manually created weight matrix
+        self.bias1 = nn.Parameter(torch.zeros(nitems))  # Manually created bias vecto
+        self.weights2 = nn.Parameter(torch.ones((latent_dims, nitems)))  # Manually created weight matrix
+        self.bias2 = nn.Parameter(torch.zeros(nitems))  # Manually created bias vecto
         self.activation = nn.Sigmoid()
 
         # remove edges between latent dimensions and items that have a zero in the Q-matrix
-        if qm is not None:
-            msk_wts = torch.ones((nitems, latent_dims), dtype=torch.float32)
-            for row in range(qm.shape[0]):
-                for col in range(qm.shape[1]):
-                    if qm[row, col] == 0:
-                        msk_wts[row][col] = 0
-            torch.nn.utils.prune.custom_from_mask(self.linear1, name='weight', mask=msk_wts)
-            torch.nn.utils.prune.custom_from_mask(self.linear2, name='weight', mask=msk_wts)
+        if qm is None:
+            self.qm = torch.ones((latent_dims, nitems))
+        else:
+            self.qm = torch.Tensor(qm).t()
 
     def forward(self, cl: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
         """
@@ -98,10 +99,17 @@ class Decoder(pl.LightningModule):
         :param m: mask representing which data is missing
         :return: tensor representing reconstructed item responses
         """
+
         #print(cl[:, 0:1])
-        out = self.linear1(theta) * cl[:,:,0:1] + self.linear2(theta) * cl[:,:,1:2]
+        self.qm = self.qm.to(self.weights1)
+        pruned_weights1 = self.weights1 * self.qm
+        pruned_weights2 = self.weights2 * self.qm
+
+        out = (torch.matmul(theta, pruned_weights1) + self.bias1) * cl[:, :, 0:1] + \
+            (torch.matmul(theta, pruned_weights2) + self.bias2) * cl[:, :, 1:2]
         out = self.activation(out)
         return out
+
 
 
 class SamplingLayer(pl.LightningModule):
@@ -150,7 +158,6 @@ class VAE(pl.LightningModule):
         self.GumbelSoftmax = GumbelSoftmax(temperature_decay)
         self.sampler = SamplingLayer()
         self.latent_dims = latent_dims
-
 
         self.decoder = Decoder(nitems, latent_dims, qm)
 
