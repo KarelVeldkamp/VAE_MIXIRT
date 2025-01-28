@@ -62,7 +62,9 @@ class Encoder(pl.LightningModule):
         return mu, log_sigma, cl
 
 
-class Decoder(pl.LightningModule):
+
+
+class IRTDecoder(pl.LightningModule):
     """
     Neural network used as decoder
     """
@@ -80,9 +82,9 @@ class Decoder(pl.LightningModule):
         #self.linear2 = nn.Linear(latent_dims, nitems, bias=True)
         #self.linear2.weight = nn.Parameter(torch.ones(self.linear2.weight.shape), requires_grad=False)
 
-        self.weights1 = nn.Parameter(torch.ones((latent_dims, nitems)))  # Manually created weight matrix
+        self.weights1 = nn.Parameter(torch.zeros((latent_dims, nitems)))  # Manually created weight matrix
         self.bias1 = nn.Parameter(torch.zeros(nitems))  # Manually created bias vecto
-        self.weights2 = nn.Parameter(torch.ones((latent_dims, nitems)))  # Manually created weight matrix
+        self.weights2 = nn.Parameter(torch.zeros((latent_dims, nitems)))  # Manually created weight matrix
         self.bias2 = nn.Parameter(torch.zeros(nitems))  # Manually created bias vecto
         self.activation = nn.Sigmoid()
 
@@ -91,6 +93,7 @@ class Decoder(pl.LightningModule):
             self.qm = torch.ones((latent_dims, nitems))
         else:
             self.qm = torch.Tensor(qm).t()
+
 
     def forward(self, cl: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
         """
@@ -105,12 +108,15 @@ class Decoder(pl.LightningModule):
         pruned_weights1 = self.weights1 * self.qm
         pruned_weights2 = self.weights2 * self.qm
 
-        out = (torch.matmul(theta, pruned_weights1) + self.bias1) * cl[:, :, 0:1] + \
-            (torch.matmul(theta, pruned_weights2) + self.bias2) * cl[:, :, 1:2]
+        #indices = torch.Tensor([1,2,3,4,5,11,12,13,14,15, 21,22, 23,24,25]).int()
+        bias1 = self.bias1
+        bias2 = self.bias2#1.clone()  # Start with bias1 as the base
+        #bias2[indices] = self.bias2[indices]
+
+        out = (torch.matmul(theta, pruned_weights1) + bias1) * cl[:, :, 0:1] + \
+            (torch.matmul(theta, pruned_weights1) + bias2) * cl[:, :, 1:2]
         out = self.activation(out)
         return out
-
-
 
 class SamplingLayer(pl.LightningModule):
     def __init__(self):
@@ -159,7 +165,7 @@ class VAE(pl.LightningModule):
         self.sampler = SamplingLayer()
         self.latent_dims = latent_dims
 
-        self.decoder = Decoder(nitems, latent_dims, qm)
+        self.decoder = IRTDecoder(nitems, latent_dims, qm)
 
         self.lr = learning_rate
         self.batch_size = batch_size
@@ -177,14 +183,17 @@ class VAE(pl.LightningModule):
         mu, log_sigma, cl = self.encoder(x)
         mu = mu.repeat(self.n_samples,1,1)
         log_sigma = log_sigma.repeat(self.n_samples,1,1)
-        cl = cl.repeat(self.n_samples,1,1)
+        log_pi = cl.repeat(self.n_samples,1,1)
 
-        cl = self.GumbelSoftmax(cl)
+
+        cl = self.GumbelSoftmax(log_pi)
         z = self.sampler(mu, log_sigma)
 
         reco = self.decoder(cl, z)
 
-        return reco, mu, log_sigma, z
+        pi = F.softmax(log_pi, dim=-1)
+
+        return reco, mu, log_sigma, z, pi, cl
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr, amsgrad=True)
@@ -192,10 +201,10 @@ class VAE(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         # forward pass
         data = batch
-        reco, mu, log_sigma, z = self(data)
+        reco, mu, log_sigma, z, pi, cl = self(data)
 
         mask = torch.ones_like(data)
-        loss, _ = self.loss(data, reco, mask, mu, log_sigma, z)
+        loss, _ = self.loss(data, reco, mask, mu, log_sigma, z, pi, cl)
         self.GumbelSoftmax.temperature *= self.GumbelSoftmax.temperature_decay
         self.log('train_loss',loss)
 
@@ -204,41 +213,63 @@ class VAE(pl.LightningModule):
     def train_dataloader(self):
         return self.dataloader
 
-    def loss(self, input, reco, mask, mu, sigma, z):
+    def loss(self, input, reco, mask, mu, sigma, z, pi, cl):
         #calculate log likelihood
 
         input = input.unsqueeze(0).repeat(reco.shape[0], 1, 1) # repeat input k times (to match reco size)
         log_p_x_theta = ((input * reco).clamp(1e-7).log() + ((1 - input) * (1 - reco)).clamp(1e-7).log()) # compute log ll
         logll = (log_p_x_theta * mask).sum(dim=-1, keepdim=True) # set elements based on missing data to zero
         #
-        # calculate KL divergence
-        log_q_theta_x = torch.distributions.Normal(mu, sigma.exp()).log_prob(z).sum(dim = -1, keepdim = True) # log q(Theta|X)
+        # calculate normal KL divergence
+        log_q_theta_x = torch.distributions.Normal(mu.detach(), sigma.exp().detach()).log_prob(z).sum(dim = -1, keepdim = True) # log q(Theta|X)
         log_p_theta = torch.distributions.Normal(torch.zeros_like(z).to(input), scale=torch.ones(mu.shape[2]).to(input)).log_prob(z).sum(dim = -1, keepdim = True) # log p(Theta)
-        kl =  log_q_theta_x - log_p_theta # kl divergence
+        kl_normal =  log_q_theta_x - log_p_theta # kl divergence
+
+        # calculate concrete KL divergence
+        pi = torch.clamp(pi, min=1e-7, max=1 - 1e-7)
+        cl = torch.clamp(cl, min=1e-7, max=1 - 1e-7)
+
+
+
+        log_p_cl = torch.distributions.RelaxedOneHotCategorical(torch.Tensor([self.GumbelSoftmax.temperature]).to(pi),
+                                                    probs=torch.ones_like(pi)).log_prob(cl).unsqueeze(-1)
+
+        log_q_cl_x = torch.distributions.RelaxedOneHotCategorical(torch.Tensor([self.GumbelSoftmax.temperature]).to(pi),
+                                                      probs=pi).log_prob(cl).unsqueeze(-1)
+
+        kl_concrete = (log_q_cl_x - log_p_cl)
+
 
         # combine into ELBO
-        elbo = logll - kl
+        elbo = logll - kl_normal - kl_concrete
         # # perform importance weighting
         with torch.no_grad():
             weight = (elbo - elbo.logsumexp(dim=0)).exp()
+
+            if cl.requires_grad:
+                cl.register_hook(lambda grad: (weight * grad).float())
+            if z.requires_grad:
+                z.register_hook(lambda grad: (weight * grad).float())
         #
         loss = (-weight * elbo).sum(0).mean()
 
 
+
         return loss, weight
 
-    def fscores(self, batch, n_mc_samples=50):
+    def fscores(self, batch, n_mc_samples=500):
         data = batch
 
         if self.n_samples == 1:
-            mu, _, _ = self.encoder(data)
-            return mu.unsqueeze(0)
+            mu, _, cl = self.encoder(data)
+            return mu.unsqueeze(0), cl.unsqueeze(0)
         else:
             scores = torch.empty((n_mc_samples, data.shape[0], self.latent_dims))
+            classes = torch.empty((n_mc_samples, data.shape[0], 2))
             for i in range(n_mc_samples):
-                reco, mu, log_sigma, z = self(data)
+                reco, mu, log_sigma, z, pi, cl = self(data)
                 mask = torch.ones_like(data)
-                loss, weight = self.loss(data, reco, mask, mu, log_sigma, z)
+                loss, weight = self.loss(data, reco, mask, mu, log_sigma, z, pi, cl)
 
                 idxs = torch.distributions.Categorical(probs=weight.permute(1,2,0)).sample()
 
@@ -247,13 +278,19 @@ class VAE(pl.LightningModule):
                 idxs = idxs.long()
 
                 # Expand idxs to match the dimensions required for gather
-                idxs_expanded = idxs.unsqueeze(-1).expand(-1, -1, z.size(2))  # Shape [10000, 1, 3]
+                idxs_expanded_z = idxs.unsqueeze(-1).expand(-1, -1, z.size(2))  # Shape [10000, 1, 3]
+                idxs_expanded_cl = idxs.unsqueeze(-1).expand(-1, -1, cl.size(2))  # Shape [10000, 1, 2]
 
                 # Use gather to select the appropriate elements from z
-                output = torch.gather(z.transpose(0, 1), 1, idxs_expanded).squeeze().detach() # Shape [10000, latent dims]
+                z_output = torch.gather(z.transpose(0, 1), 1, idxs_expanded_z).squeeze().detach() # Shape [10000, latent dims]
+
+                cl_output = torch.gather(cl.transpose(0, 1), 1,
+                                      idxs_expanded_cl).squeeze().detach()  # Shape [10000, latent dims]
                 if self.latent_dims == 1:
-                    output = output.unsqueeze(-1)
+                    cl_output = cl_output.unsqueeze(-1)
+                    z_output =  z_output.unsqueeze(-1)
 
-                scores[i, :, :] = output
+                scores[i, :, :] = z_output
+                classes[i, :, :] = cl_output
 
-            return scores
+            return scores, classes

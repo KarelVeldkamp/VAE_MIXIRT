@@ -1,0 +1,7 @@
+torch>=1.10.0  # Ensure compatibility with your code
+pytorch-lightning>=2.0.0  # For Lightning framework
+numpy  # For numerical operations
+scipy  # For statistics (e.g., pearsonr)
+pandas  # For data manipulation
+matplotlib  # For plotting
+pyyaml  # For configuration files

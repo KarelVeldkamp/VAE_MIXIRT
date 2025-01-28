@@ -1,5 +1,7 @@
 figures/**
+results/**
 logs/**
-data/**
+true/data/**
+true/pars/**
 venv/**
 .venv/**
